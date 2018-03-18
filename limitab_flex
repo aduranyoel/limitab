@@ -1,0 +1,148 @@
+#!/bin/bash
+
+### BEGIN INIT INFO
+# Provides:          limitab
+# Required-Start:    $network $syslog
+# Required-Stop:     $network $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Control de trafico personalizado
+### END INIT INFO
+
+#
+# Author: Yoel Antonio Duran Diaz <yoet92@gmail.com>
+# Git: https://github.com/yoet92/limitab.git
+#
+
+#==========================VARIABLES=================================#
+IPT=/sbin/iptables
+TC=/sbin/tc
+
+# LAN INTERFACE
+DEV=eth1
+
+TOTAL=3000
+
+LAN_RED=10.0.0.0/24
+INICIO_IP=50
+FIN_IP=200
+
+# No. Hosts Pasivos
+PASIVOS=5
+
+# IP VIP
+IP_VIP=()
+# PUERTOS TCP/UDP SIN LIMITE
+SERV=(22 53 67 80 8443)
+
+#==========================START=====================================#
+start_rules() {
+# Utils
+RED=`echo ${LAN_RED} | cut -d / -f1 | cut -d . -f1,2,3`
+HOSTS_UP=`nmap -sP ${LAN_RED} | grep -w "hosts up" | cut -d \( -f2 | cut -d \  -f1`
+let ACTIVOS=${HOSTS_UP}-${PASIVOS}
+if [[ $ACTIVOS -le 0 ]]; then
+ACTIVOS=1
+fi
+let LIMITE=${TOTAL}/${ACTIVOS}
+
+$TC qdisc del dev $DEV root 2>&1 >/dev/null
+$TC qdisc add dev $DEV root handle 1: htb
+$TC class add dev $DEV parent 1: classid 1:1 htb rate ${TOTAL}kbit
+
+#=============================================SERVICIOS SIN LIMITE===#
+$TC class add dev $DEV parent 1: classid 1:2 htb rate 1gbps
+$TC class add dev $DEV parent 1:2 classid 2:500 htb rate 1gbps ceil 1gbps prio 1
+$TC qdisc add dev $DEV parent 2:500 handle 500: sfq perturb 10
+# ICMP
+$TC filter add dev $DEV parent 1: protocol ip prio 1 u32 match ip protocol 1 0xff flowid 2:500
+# SYN
+$IPT -F -t mangle
+$IPT -t mangle -I PREROUTING -p tcp --syn -j MARK --set-mark 1
+$IPT -t mangle -I PREROUTING -p tcp --syn -j RETURN
+$TC filter add dev $DEV parent 1: protocol ip prio 1 handle 1 fw classid 2:500
+# SERV
+for s in ${SERV[*]}
+do
+$TC filter add dev $DEV parent 1: protocol ip prio 1 u32 match ip dport $s 0xffff flowid 2:500
+$TC filter add dev $DEV parent 1: protocol ip prio 1 u32 match ip sport $s 0xffff flowid 2:500
+done
+for v in ${IP_VIP[*]}
+do
+$TC filter add dev $DEV parent 1: protocol ip prio 1 u32 match ip dst ${RED}.$v/32 flowid 2:500
+$TC filter add dev $DEV parent 1: protocol ip prio 1 u32 match ip src ${RED}.$v/32 flowid 2:500
+done
+#=============================================LLIMITANDO A SUB RED===#
+
+for((i=$INICIO_IP;i<=$FIN_IP;i++))
+do
+$TC class add dev $DEV parent 1:1 classid 1:${i}0 htb rate ${LIMITE}kbit ceil ${LIMITE}kbit prio 2
+$TC qdisc add dev $DEV parent 1:${i}0 handle ${i}0: sfq perturb 10
+
+$TC filter add dev $DEV parent 1: protocol ip prio 2 u32 match ip dst ${RED}.$i/32 flowid 1:${i}0
+$TC filter add dev $DEV parent 1: protocol ip prio 2 u32 match ip src ${RED}.$i/32 flowid 1:${i}0
+done
+echo "---
+TOTAL DE HOSTS: ${HOSTS_UP}
+HOSTS PASIVOS: ${PASIVOS}
+HOSTS ACTIVOS: ${ACTIVOS}
+LIMITE POR USUARIO: ${LIMITE}
+"
+cat > /root/ancho_de_banda << EOF
+------------------------------
+$(date)
+------------------------------
+TOTAL DE HOSTS: ${HOSTS_UP}
+HOSTS PASIVOS: ${PASIVOS}
+HOSTS ACTIVOS: ${ACTIVOS}
+LIMITE POR USUARIO: ${LIMITE}
+------------------------------
+EOF
+}
+
+#==========================STOP======================================#
+stop_rules() {
+$TC qdisc del dev $DEV root 2>&1 >/dev/null
+$IPT -F -t mangle
+}
+
+#==========================STATUS====================================#
+status_rules() {
+watch -n1 "
+echo "========================TOTAL DE PACKETES======================         Ctrl + C = SALIR";
+echo "";
+${TC} -s -d qdisc show dev ${DEV};
+#echo "======================================================CLASES==";
+#echo "";
+#${TC} -s -d class show dev ${DEV}
+"
+}
+
+#====================================================================#
+case "$1" in
+    start|i)
+start_rules
+echo "
+================================
+      LIMITE ESTABLESIDO
+================================
+"
+
+    ;;
+    stop|d)
+stop_rules
+echo "
+================================
+          SIN LIMITE
+================================
+"
+
+    ;;
+    status|s)
+status_rules
+    ;;
+    *)
+echo "Uso: $0 {start(i)|stop(d)|status(s)}"
+    ;;
+
+esac
